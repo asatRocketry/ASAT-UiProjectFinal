@@ -1,0 +1,506 @@
+/*
+ * Epoll-based WebSocket server with remote sensor data client.
+ *
+ * This code:
+ *  - Connects to a remote WebSocket sensor data server (REMOTE_WS_IP:REMOTE_WS_PORT)
+ *  - Listens for frontend WebSocket clients on FRONTEND_PORT
+ *  - Uses epoll to monitor all file descriptors for scalable event handling
+ *  - Parses JSON sensor data (via cJSON), writes each reading to Redis (via hiredis),
+ *    and buffers the data
+ *  - Every 100 ms, broadcasts the buffered sensor data (packaged as a WebSocket text frame)
+ *    to all connected frontend clients.
+ *
+ * Custom WebSocket functions are provided in wshandshake.c and websocket.c.
+ */
+
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <stdint.h>
+ #include <stdbool.h>
+ #include <unistd.h>
+ #include <errno.h>
+ #include <string.h>
+ #include <signal.h>
+ #include <fcntl.h>
+ #include <sys/epoll.h>
+ #include <sys/socket.h>
+ #include <arpa/inet.h>
+ #include <netinet/in.h>
+ #include <time.h>
+ 
+ #include "wshandshake.h"  // Custom WebSocket handshake functions
+ #include "websocket.h"    // Custom WebSocket frame functions
+ #include "cJSON.h"        // JSON parsing library
+ #include "hiredis.h"      // Redis connectivity
+ 
+ /*-------------------- Configuration --------------------*/
+ #define FRONTEND_PORT 8001
+ #define REMOTE_WS_IP "192.168.43.1"
+ #define REMOTE_WS_PORT 8081
+ #define BUFFER_SIZE 4096
+ #define MAX_CLIENTS 1024
+ #define SENSOR_BUFFER_MAX 100000
+ #define PIPELINE_BATCH_SIZE 100 
+ 
+ /*-------------------- Data Structures --------------------*/
+ // Represents a frontend client connection.
+ typedef struct {
+     int fd;
+     bool handshake_done;
+     uint8_t buffer[BUFFER_SIZE];
+     size_t buffer_len;
+ } client_t;
+ 
+ client_t g_clients[MAX_CLIENTS];
+ 
+ /* Global file descriptors */
+ int g_server_fd = -1;   // Frontend WebSocket server (listening) socket
+ int g_remote_fd = -1;   // Remote WebSocket connection (sensor data)
+ 
+ /* Redis connection context */
+ redisContext *redis_ctx = NULL;
+ 
+ /* Epoll file descriptor */
+ int epoll_fd = -1;
+ 
+ /* Sensor data structure and buffer */
+ typedef struct {
+     char name[64];
+     double value;
+     uint64_t timestamp;
+     int warning;
+ } sensor_data_t;
+ 
+ sensor_data_t sensor_buffer[SENSOR_BUFFER_MAX];
+ sensor_data_t latest_sensor_buffer[SENSOR_BUFFER_MAX];
+ int latest_sensor_buffer_count = 0;
+ int sensor_buffer_count = 0;
+ uint64_t last_broadcast_time = 0;
+ 
+ /*-------------------- Utility Functions --------------------*/
+ // Set a file descriptor to non-blocking mode.
+ static void set_nonblocking(int fd) {
+     int flags = fcntl(fd, F_GETFL, 0);
+     if (flags < 0)
+         flags = 0;
+     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+ }
+ 
+ // Add a file descriptor to the epoll instance.
+ static void add_to_epoll(int fd, uint32_t events, void *ptr) {
+     struct epoll_event ev;
+     ev.events = events;
+     ev.data.ptr = ptr;
+     if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev) < 0) {
+         perror("epoll_ctl ADD");
+     }
+ }
+ 
+ // Remove a file descriptor from the epoll instance.
+ static void remove_from_epoll(int fd) {
+     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+ }
+ 
+ /*-------------------- Socket Initialization --------------------*/
+ // Initialize the frontend server socket.
+ static int init_frontend_server(int port) {
+     int fd = socket(AF_INET, SOCK_STREAM, 0);
+     if (fd < 0) {
+         perror("socket()");
+         return -1;
+     }
+     int opt = 1;
+     if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+         perror("setsockopt()");
+         close(fd);
+         return -1;
+     }
+     struct sockaddr_in addr;
+     memset(&addr, 0, sizeof(addr));
+     addr.sin_family = AF_INET;
+     addr.sin_addr.s_addr = INADDR_ANY;
+     addr.sin_port = htons(port);
+     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+         perror("bind()");
+         close(fd);
+         return -1;
+     }
+     if (listen(fd, MAX_CLIENTS) < 0) {
+         perror("listen()");
+         close(fd);
+         return -1;
+     }
+     set_nonblocking(fd);
+     return fd;
+ }
+  
+ // Connect to the remote WebSocket sensor data server.
+ static int connect_remote_ws(const char *ip, int port) {
+     int fd = socket(AF_INET, SOCK_STREAM, 0);
+     if (fd < 0) {
+         perror("socket() remote");
+         return -1;
+     }
+     struct sockaddr_in addr;
+     memset(&addr, 0, sizeof(addr));
+     addr.sin_family = AF_INET;
+     addr.sin_port = htons(port);
+     if (inet_pton(AF_INET, ip, &addr.sin_addr) <= 0) {
+         perror("inet_pton()");
+         close(fd);
+         return -1;
+     }
+     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+         perror("connect() remote");
+         close(fd);
+         return -1;
+     }
+     set_nonblocking(fd);
+     printf("Connected to remote WebSocket server at %s:%d\n", ip, port);
+     return fd;
+ }
+ 
+ /*-------------------- Frontend Client Handling --------------------*/
+ // Accept a new frontend client connection.
+ static void handle_new_client() {
+     struct sockaddr_in client_addr;
+     socklen_t addr_len = sizeof(client_addr);
+     int client_fd = accept(g_server_fd, (struct sockaddr *)&client_addr, &addr_len);
+     if (client_fd < 0) {
+         if (errno != EAGAIN && errno != EWOULDBLOCK)
+             perror("accept()");
+         return;
+     }
+     set_nonblocking(client_fd);
+     // Find a free slot for the new client.
+     for (int i = 0; i < MAX_CLIENTS; i++) {
+         if (g_clients[i].fd == -1) {
+             g_clients[i].fd = client_fd;
+             g_clients[i].handshake_done = false;
+             g_clients[i].buffer_len = 0;
+             add_to_epoll(client_fd, EPOLLIN | EPOLLET, &g_clients[i]);
+             printf("New frontend client connected. FD = %d\n", client_fd);
+             return;
+         }
+     }
+     printf("Max clients reached, rejecting connection.\n");
+     close(client_fd);
+ }
+  
+ // Close a frontend client connection.
+ static void close_client(client_t *client) {
+     if (client->fd != -1) {
+         remove_from_epoll(client->fd);
+         close(client->fd);
+         client->fd = -1;
+         client->handshake_done = false;
+         client->buffer_len = 0;
+     }
+ }
+  
+ // Send a text message (as a WebSocket frame) to a specific frontend client.
+ static void ws_send_text(int fd, const char *msg) {
+     uint8_t out_buf[BUFFER_SIZE];
+     size_t out_size = sizeof(out_buf);
+     ws_frame frame;
+     memset(&frame, 0, sizeof(frame));
+     frame.type = WS_TEXT_FRAME;
+     frame.payload = (uint8_t *)msg;
+     frame.payload_length = strlen(msg);
+     ws_create_frame(&frame, out_buf, &out_size);
+     if (send(fd, out_buf, out_size, 0) < 0) {
+         perror("send() ws_send_text");
+     }
+ }
+  
+ // Broadcast a text message to all connected (and handshaken) frontend clients.
+ static void broadcast_text(const char *msg) {
+     for (int i = 0; i < MAX_CLIENTS; i++) {
+         if (g_clients[i].fd != -1 && g_clients[i].handshake_done) {
+             ws_send_text(g_clients[i].fd, msg);
+         }
+     }
+ }
+ 
+ /*-------------------- Sensor Data Handling --------------------*/
+ // Parse JSON sensor data from remote WebSocket text frames,
+ // update the sensor buffer, and write each reading to Redis.
+ static void parse_sensor_data(const char *data) {
+   
+     cJSON *root = cJSON_Parse(data);
+     if (!root || !cJSON_IsArray(root)) {
+         printf("Error parsing JSON sensor data: %s\n", data);
+         if (root) cJSON_Delete(root);
+         return;
+     }
+     int array_size = cJSON_GetArraySize(root);
+     for (int i = 0; i < array_size; i++) {
+         cJSON *item = cJSON_GetArrayItem(root, i);
+         if (!cJSON_IsObject(item)) continue;
+         cJSON *title = cJSON_GetObjectItem(item, "title");
+         cJSON *value = cJSON_GetObjectItem(item, "value");
+         cJSON *timestamp_json = cJSON_GetObjectItem(item, "timestamp");
+         if (!title || !value) continue;
+         if (!cJSON_IsString(title) || (!(cJSON_IsNumber(value) || cJSON_IsString(value))))
+             continue;
+         if (sensor_buffer_count < SENSOR_BUFFER_MAX) {
+             sensor_data_t *sd = &sensor_buffer[sensor_buffer_count++];
+             strncpy(sd->name, title->valuestring, sizeof(sd->name) - 1);
+             sd->name[sizeof(sd->name)-1] = '\0';
+             double sensor_value = cJSON_IsNumber(value) ? value->valuedouble : atof(value->valuestring);
+             sd->value = sensor_value;
+             if (timestamp_json && cJSON_IsNumber(timestamp_json))
+                 sd->timestamp = (uint64_t) timestamp_json->valuedouble;
+             else {
+                 struct timespec ts;
+                 clock_gettime(CLOCK_REALTIME, &ts);
+                 sd->timestamp = (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+             }
+             // For demonstration, set warning if sensor_value > 1000.
+             sd->warning = (sensor_value > 1000) ? 1 : 0;
+
+
+             
+             if (redis_ctx) {
+                static int pipeline_count = 0;  // Keep track of batched commands
+            
+                // Queue the TS.ADD command (non-blocking)
+                redisAppendCommand(redis_ctx, "TS.ADD %s %llu %f",
+                                   sd->name, (unsigned long long)sd->timestamp, sd->value);
+                pipeline_count++;
+            
+                // Every PIPELINE_BATCH_SIZE entries, execute batch and clear pipeline
+                if (pipeline_count >= PIPELINE_BATCH_SIZE) {
+                    redisReply *reply;
+                    for (int i = 0; i < pipeline_count; i++) {
+                        if (redisGetReply(redis_ctx, (void **)&reply) == REDIS_ERR) {
+                            printf("Redis error executing pipelined command\n");
+                        }
+                        if (reply) freeReplyObject(reply);
+                    }
+                    pipeline_count = 0;  // Reset batch counter
+                }
+            }
+         }
+     }
+     
+     struct timespec ts;
+     clock_gettime(CLOCK_REALTIME, &ts);
+     uint64_t current_time = (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+     if((current_time - last_broadcast_time) >= 100) {
+         memcpy(latest_sensor_buffer, sensor_buffer, sizeof(sensor_data_t) * sensor_buffer_count);
+         latest_sensor_buffer_count = sensor_buffer_count;
+         broadcast_sensor_data();
+         last_broadcast_time = current_time;
+
+     }
+     memset(sensor_buffer, 0, sizeof(sensor_data_t) * sensor_buffer_count);
+     sensor_buffer_count = 0;
+     
+     cJSON_Delete(root);
+ }
+  
+ // Broadcast the buffered sensor data to all connected frontend clients
+ // and then clear the sensor buffer.
+void broadcast_sensor_data() {
+     if (latest_sensor_buffer_count == 0)
+         return;
+     cJSON *json_array = cJSON_CreateArray();
+     for (int i = 0; i < latest_sensor_buffer_count; i++) {
+         cJSON *item = cJSON_CreateObject();
+         cJSON_AddStringToObject(item, "name", latest_sensor_buffer[i].name);
+         cJSON_AddNumberToObject(item, "value", latest_sensor_buffer[i].value);
+         cJSON_AddNumberToObject(item, "timestamp", latest_sensor_buffer[i].timestamp);
+         cJSON_AddNumberToObject(item, "warning", latest_sensor_buffer[i].warning);
+         cJSON_AddItemToArray(json_array, item);
+     }
+     char *json_str = cJSON_PrintUnformatted(json_array);
+     cJSON_Delete(json_array);
+     
+     // Debug print: show data being forwarded.
+     printf("Forwarding sensor data to frontend: %s\n", json_str);
+     
+     uint8_t frame_data[BUFFER_SIZE];
+     size_t frame_len = sizeof(frame_data);
+     ws_create_text_frame(json_str, frame_data, &frame_len);
+     free(json_str);
+  
+     for (int i = 0; i < MAX_CLIENTS; i++) {
+         if (g_clients[i].fd != -1 && g_clients[i].handshake_done) {
+             if (send(g_clients[i].fd, frame_data, frame_len, 0) < 0) {
+                 perror("send() broadcast_sensor_data");
+             }
+         }
+     }
+     latest_sensor_buffer_count = 0;
+ }
+  
+ /*-------------------- Remote WebSocket Handling --------------------*/
+ // Handle incoming data from the remote WebSocket connection (sensor data).
+ static void handle_remote_ws_read() {
+     uint8_t recv_buf[BUFFER_SIZE];
+     ssize_t n = recv(g_remote_fd, recv_buf, sizeof(recv_buf), 0);
+     if (n <= 0) {
+         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+             return;
+         printf("Remote WS connection lost. Reconnecting in 10 seconds...\n");
+         close(g_remote_fd);
+         
+         while ((g_remote_fd = connect_remote_ws(REMOTE_WS_IP, REMOTE_WS_PORT)) < 0) {
+             fprintf(stderr, "Reconnection attempt failed. Retrying in 10 seconds...\n");
+             sleep(1);
+         }
+         add_to_epoll(g_remote_fd, EPOLLIN, &g_remote_fd);
+         return;
+     }
+     ws_frame frame;
+     memset(&frame, 0, sizeof(frame));
+     ws_parse_frame(&frame, recv_buf, n);
+	printf("%s",recv_buf);
+     if (frame.type == WS_TEXT_FRAME && frame.payload) {
+         char *text = strndup((char *)frame.payload, frame.payload_length);
+         // Debug print: show the remote sensor data received.
+         printf("Received remote sensor data: %s\n", text);
+         parse_sensor_data(text);
+         free(text);
+     }
+     // Ignore other frame types.
+ }
+  
+ /*-------------------- Frontend Client Read Handling --------------------*/
+ // Handle data from a frontend client. Here we process handshake data if needed.
+ static void handle_client_read(client_t *client) {
+     while (1) {
+         uint8_t recv_buf[BUFFER_SIZE];
+         ssize_t n = recv(client->fd, recv_buf, sizeof(recv_buf), 0);
+         if (n <= 0) {
+             if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+                 break;
+             printf("Client FD %d disconnected.\n", client->fd);
+             close_client(client);
+             break;
+         }
+         if (!client->handshake_done) {
+             if (client->buffer_len + n > BUFFER_SIZE) {
+                 printf("Handshake buffer overflow for client FD %d\n", client->fd);
+                 close_client(client);
+                 break;
+             }
+             memcpy(client->buffer + client->buffer_len, recv_buf, n);
+             client->buffer_len += n;
+             http_header header;
+             memset(&header, 0, sizeof(header));
+             size_t out_len = BUFFER_SIZE;
+             ws_handshake(&header, client->buffer, client->buffer_len, &out_len);
+             if (header.type == WS_OPENING_FRAME) {
+                 send(client->fd, client->buffer, out_len, 0);
+                 client->handshake_done = true;
+                //  ws_send_text(client->fd, "Welcome to sensor server");
+                 printf("Client FD %d handshake done (Key=%s)\n", client->fd, header.key);
+                 client->buffer_len = 0;
+             } else if (out_len > 0) {
+                 send(client->fd, client->buffer, out_len, 0);
+                 close_client(client);
+                 break;
+             }
+         } else {
+             // For this application, frontend clients only receive data.
+         }
+     }
+ }
+  
+ /*-------------------- Signal Handling & Shutdown --------------------*/
+ static void handle_sigint(int sig) {
+     (void)sig;
+     printf("SIGINT received, shutting down...\n");
+     uint8_t close_buf[BUFFER_SIZE];
+     size_t close_size = sizeof(close_buf);
+     ws_create_closing_frame(close_buf, &close_size);
+     for (int i = 0; i < MAX_CLIENTS; i++) {
+         if (g_clients[i].fd != -1) {
+             send(g_clients[i].fd, close_buf, close_size, 0);
+             close(g_clients[i].fd);
+         }
+     }
+     if (g_server_fd != -1) close(g_server_fd);
+     if (g_remote_fd != -1) close(g_remote_fd);
+     if (redis_ctx) redisFree(redis_ctx);
+     exit(0);
+ }
+  
+ /*-------------------- Main Event Loop --------------------*/
+ int main() {
+     signal(SIGINT, handle_sigint);
+     
+     // Initialize all client slots.
+     for (int i = 0; i < MAX_CLIENTS; i++) {
+         g_clients[i].fd = -1;
+         g_clients[i].handshake_done = false;
+         g_clients[i].buffer_len = 0;
+     }
+     
+     // Initialize Redis.
+     redis_ctx = redisConnect("127.0.0.1", 6379);
+     if (!redis_ctx || redis_ctx->err) {
+         if (redis_ctx) {
+             printf("Redis error: %s\n", redis_ctx->errstr);
+             redisFree(redis_ctx);
+         }
+         redis_ctx = NULL;
+     }
+     
+     // Set up the frontend WebSocket server.
+     g_server_fd = init_frontend_server(FRONTEND_PORT);
+     if (g_server_fd < 0) {
+         fprintf(stderr, "Failed to initialize frontend server\n");
+         exit(1);
+     }
+     printf("Frontend WebSocket server listening on port %d\n", FRONTEND_PORT);
+     
+     // Attempt to connect to the remote WebSocket sensor data server.
+     while ((g_remote_fd = connect_remote_ws(REMOTE_WS_IP, REMOTE_WS_PORT)) < 0) {
+         fprintf(stderr, "Failed to connect to remote WebSocket server. Retrying in 10 seconds...\n");
+         sleep(1);
+     }
+     
+     // Create epoll instance.
+     epoll_fd = epoll_create1(0);
+     if (epoll_fd < 0) {
+         perror("epoll_create1()");
+         exit(1);
+     }
+     // Register the frontend server and remote WS descriptors.
+     add_to_epoll(g_server_fd, EPOLLIN, &g_server_fd);
+     add_to_epoll(g_remote_fd, EPOLLIN, &g_remote_fd);
+     
+     // Main event loop with a timeout of 100 ms.
+     struct epoll_event events[1024];
+     while (1) {
+         int nready = epoll_wait(epoll_fd, events, 1024, 0.001);
+         if (nready < 0) {
+             if (errno == EINTR)
+                 continue;
+             perror("epoll_wait()");
+             break;
+         }
+         for (int i = 0; i < nready; i++) {
+             if (events[i].data.ptr == &g_server_fd) {
+                 // New incoming frontend connection.
+                 handle_new_client();
+             } else if (events[i].data.ptr == &g_remote_fd) {
+                 // Data from remote sensor server.
+                 handle_remote_ws_read();
+             } else {
+                 // Frontend client event.
+                 client_t *client = (client_t *)events[i].data.ptr;
+                 if (client)
+                     handle_client_read(client);
+             }
+         }
+         // Every 100 ms, broadcast any buffered sensor data.
+        //  broadcast_sensor_data();
+     }
+     handle_sigint(0);
+     return 0;
+ }
+ 

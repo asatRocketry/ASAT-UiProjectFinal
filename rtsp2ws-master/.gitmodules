@@ -1,0 +1,3 @@
+[submodule "include/simple_ws"]
+	path = include/simple_ws
+	url = git@github.com:AtPapadop/simple_ws.git

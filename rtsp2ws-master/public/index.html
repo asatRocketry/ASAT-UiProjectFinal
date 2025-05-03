@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <title>RTSP Stream Viewer with Large Canvas</title>
+    <style>
+        body {
+            background: #222;
+            color: #eee;
+            font-family: sans-serif;
+            text-align: center;
+            padding-top: 20px;
+        }
+
+        canvas {
+            background: black;
+            margin-top: 20px;
+            border: 1px solid #444;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>RTSP Stream Viewer</h1>
+    <!-- Canvas dimensions set to 2560x1440 -->
+    <canvas id="videoCanvas" width="2560" height="1440"></canvas>
+    <script>
+        const wsUrl = "ws://localhost:8002";
+        const canvas = document.getElementById("videoCanvas");
+        const ctx = canvas.getContext("2d");
+
+        let videoDecoder;
+        let configured = false;
+        let frameCount = 0; // For timestamping frames
+
+        if (!window.VideoDecoder) {
+            alert("Your browser does not support WebCodecs. Please try Chrome or Edge with experimental flags enabled.");
+        }
+
+        // Check if the data appears to be in Annex‑B format by looking for start codes.
+        function isAnnexBFormat(data) {
+            return (data.length >= 3 &&
+                data[0] === 0 && data[1] === 0 &&
+                (data[2] === 1 || (data.length >= 4 && data[2] === 0 && data[3] === 1)));
+        }
+
+        // Extract NAL units from Annex‑B formatted data.
+        function extractNALUnits(data) {
+            const nalUnits = [];
+            let i = 0;
+            while (i < data.length) {
+                // Look for a start code
+                if (i + 3 < data.length && data[i] === 0 && data[i + 1] === 0) {
+                    let startCodeLength = 0;
+                    if (data[i + 2] === 1) {
+                        startCodeLength = 3;
+                    } else if (i + 4 < data.length && data[i + 2] === 0 && data[i + 3] === 1) {
+                        startCodeLength = 4;
+                    }
+                    if (startCodeLength > 0) {
+                        let j = i + startCodeLength;
+                        // Find next start code.
+                        while (j < data.length) {
+                            if (j + 3 < data.length && data[j] === 0 && data[j + 1] === 0 &&
+                                (data[j + 2] === 1 || (j + 4 < data.length && data[j + 2] === 0 && data[j + 3] === 1))) {
+                                break;
+                            }
+                            j++;
+                        }
+                        const nal = data.slice(i + startCodeLength, j);
+                        nalUnits.push(nal);
+                        i = j;
+                        continue;
+                    }
+                }
+                i++;
+            }
+            return nalUnits;
+        }
+
+        // Convert Annex‑B configuration (SPS/PPS) to a valid avcC record.
+        function convertAnnexBConfigToAVCC(data) {
+            const nalUnits = extractNALUnits(data);
+            // Filter for SPS (type 7) and PPS (type 8)
+            const spsUnits = nalUnits.filter(nal => (nal[0] & 0x1F) === 7);
+            const ppsUnits = nalUnits.filter(nal => (nal[0] & 0x1F) === 8);
+            if (spsUnits.length === 0 || ppsUnits.length === 0) {
+                console.error("No SPS or PPS found in configuration data.");
+                return null;
+            }
+            // For simplicity, take the first SPS and PPS.
+            const sps = spsUnits[0];
+            const pps = ppsUnits[0];
+
+            // Build the avcC record.
+            // Structure:
+            // [configurationVersion, AVCProfileIndication, profile_compatibility, AVCLevelIndication,
+            //  lengthSizeMinusOne, numOfSPS, SPS length, SPS, numOfPPS, PPS length, PPS]
+            const avccSize = 5 + 1 + 2 + sps.length + 1 + 2 + pps.length;
+            const avcc = new Uint8Array(avccSize);
+            let offset = 0;
+            avcc[offset++] = 1; // configurationVersion
+            avcc[offset++] = sps[1]; // AVCProfileIndication (from SPS)
+            avcc[offset++] = sps[2]; // profile_compatibility
+            avcc[offset++] = sps[3]; // AVCLevelIndication
+            avcc[offset++] = 0xFF; // 6 bits reserved + 2 bits lengthSizeMinusOne (3 means 4-byte lengths)
+
+            // SPS
+            avcc[offset++] = 0xE1; // 3 bits reserved + 5 bits number of SPS (1)
+            avcc[offset++] = (sps.length >> 8) & 0xFF;
+            avcc[offset++] = sps.length & 0xFF;
+            avcc.set(sps, offset);
+            offset += sps.length;
+
+            // PPS
+            avcc[offset++] = 1; // number of PPS
+            avcc[offset++] = (pps.length >> 8) & 0xFF;
+            avcc[offset++] = pps.length & 0xFF;
+            avcc.set(pps, offset);
+            offset += pps.length;
+
+            return avcc;
+        }
+
+        // For regular frame data (non-configuration), convert Annex‑B to length-prefixed AVCC.
+        function convertAnnexBToAVCC(data) {
+            const positions = [];
+            for (let i = 0; i < data.length - 3; i++) {
+                if (data[i] === 0 && data[i + 1] === 0) {
+                    if (data[i + 2] === 1) {
+                        positions.push({ pos: i, len: 3 });
+                        i += 2;
+                        continue;
+                    } else if (i < data.length - 4 && data[i + 2] === 0 && data[i + 3] === 1) {
+                        positions.push({ pos: i, len: 4 });
+                        i += 3;
+                        continue;
+                    }
+                }
+            }
+            if (positions.length === 0) {
+                const avcc = new Uint8Array(4 + data.length);
+                new DataView(avcc.buffer).setUint32(0, data.length);
+                avcc.set(data, 4);
+                return avcc;
+            }
+            const nalUnits = [];
+            for (let i = 0; i < positions.length; i++) {
+                const start = positions[i].pos + positions[i].len;
+                const end = (i + 1 < positions.length) ? positions[i + 1].pos : data.length;
+                if (start < end) {
+                    nalUnits.push(data.slice(start, end));
+                }
+            }
+            let totalLength = 0;
+            nalUnits.forEach(unit => totalLength += 4 + unit.length);
+            const avccData = new Uint8Array(totalLength);
+            let offset = 0;
+            nalUnits.forEach(unit => {
+                new DataView(avccData.buffer, offset, 4).setUint32(0, unit.length);
+                offset += 4;
+                avccData.set(unit, offset);
+                offset += unit.length;
+            });
+            return avccData;
+        }
+
+        const socket = new WebSocket(wsUrl);
+        socket.binaryType = "arraybuffer";
+
+        socket.addEventListener("open", () => {
+            console.log("WebSocket connected");
+        });
+
+        socket.addEventListener("message", (event) => {
+            const rawData = new Uint8Array(event.data);
+
+            // First message: configuration (SPS/PPS).
+            if (!configured) {
+                console.log("Received configuration data. Configuring decoder...");
+                let configData = rawData;
+                if (rawData[0] !== 1 && isAnnexBFormat(rawData)) {
+                    console.log("Configuration data is in Annex B format, converting to avcC...");
+                    configData = convertAnnexBConfigToAVCC(rawData);
+                    if (!configData) {
+                        console.error("Failed to convert configuration data to avcC.");
+                        return;
+                    }
+                }
+                try {
+                    videoDecoder = new VideoDecoder({
+                        output: frame => {
+                            ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+                            frame.close();
+                        },
+                        error: error => {
+                            console.error("Decoder error:", error);
+                        }
+                    });
+                    const config = {
+                        codec: 'avc1.64001F', // Adjust if needed for your stream's profile.
+                        description: configData.buffer
+                    };
+                    videoDecoder.configure(config);
+                    configured = true;
+                    console.log("Decoder configured successfully.");
+                } catch (e) {
+                    console.error("Failed to configure decoder:", e);
+                }
+                return;
+            }
+
+            // For subsequent frame data, assume it's in Annex‑B and convert.
+            const avccData = convertAnnexBToAVCC(rawData);
+            if (avccData.length < 5) {
+                console.warn("Received data too short for a valid NAL unit.");
+                return;
+            }
+            const nalLength = (avccData[0] << 24) | (avccData[1] << 16) | (avccData[2] << 8) | avccData[3];
+            if (nalLength <= 0 || avccData.length < 4 + nalLength) {
+                console.warn("Invalid NAL unit length.");
+                return;
+            }
+            const nalType = avccData[4] & 0x1F;
+            const chunkType = (nalType === 5) ? "key" : "delta";
+            try {
+                const chunk = new EncodedVideoChunk({
+                    type: chunkType,
+                    timestamp: frameCount * 40000, // Example: 40ms per frame (adjust as needed)
+                    data: avccData
+                });
+                frameCount++;
+                videoDecoder.decode(chunk);
+            } catch (e) {
+                console.error("Decode error:", e);
+            }
+        });
+
+        socket.addEventListener("close", () => {
+            console.log("WebSocket connection closed.");
+        });
+    </script>
+</body>
+
+</html>
